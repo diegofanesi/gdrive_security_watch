@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import logging
 import os
 import random
@@ -43,6 +44,28 @@ QUERY = "'me' in owners and trashed = false"
 
 MAX_RETRIES = 6
 BASE_BACKOFF = 1.0
+
+# 403s are only retryable when Google says we're being throttled. Other 403s
+# (cannotDeletePermission, insufficientFilePermissions, forbidden) are permanent
+# and retrying them just burns ~30s of exponential backoff per failure.
+RETRYABLE_403_REASONS = {
+    "rateLimitExceeded",
+    "userRateLimitExceeded",
+    "sharingRateLimitExceeded",
+    "quotaExceeded",
+}
+
+
+def _http_error_reason(err) -> str:
+    """Extract the Drive API 'reason' string from an HttpError, or '' if absent."""
+    try:
+        body = json.loads(err.content.decode("utf-8") if isinstance(err.content, bytes) else err.content)
+        errors = body.get("error", {}).get("errors") or []
+        if errors:
+            return errors[0].get("reason", "") or ""
+    except (ValueError, AttributeError, KeyError):
+        pass
+    return ""
 
 
 # ---------------------------------------------------------------------------
@@ -164,7 +187,12 @@ def _execute_with_backoff(request):
             return request.execute()
         except HttpError as err:
             status = getattr(err.resp, "status", None)
-            retryable = status in (403, 429, 500, 502, 503, 504)
+            if status == 403:
+                # Only retry rate-limit-style 403s; cannotDeletePermission and
+                # friends are permanent and re-trying them wastes a minute per file.
+                retryable = _http_error_reason(err) in RETRYABLE_403_REASONS
+            else:
+                retryable = status in (429, 500, 502, 503, 504)
             if not retryable or attempt == MAX_RETRIES - 1:
                 raise
             sleep_for = BASE_BACKOFF * (2**attempt) + random.uniform(0, 1)
@@ -276,18 +304,31 @@ def process_file(
             revoked += 1
         except HttpError as err:
             status = getattr(err.resp, "status", None)
-            # Inherited permissions on child items can't be deleted directly;
-            # parent folder sweep will handle them.
-            if status in (400, 403):
-                logging.debug(
-                    "Skipping inherited/forbidden permission %s on %s (%s)",
-                    target,
-                    name,
-                    status,
+            reason = _http_error_reason(err)
+            if status == 404:
+                # The permission was already gone — almost always because we
+                # deleted the same principal from a parent folder earlier in
+                # this run and Drive cascaded the removal to children.
+                logging.info(
+                    "Already removed: %s from %s (cascaded from parent)",
+                    target, name,
+                )
+                csv_writer.writerow(
+                    [run_stamp, "ALREADY_REMOVED", file_id, name, link, target,
+                     perm.get("role", ""), ""]
+                )
+                revoked += 1
+            elif status in (400, 403):
+                # Inherited or otherwise undeletable permission (shared drive,
+                # domain policy, etc.). The CSV row records the exact reason so
+                # the user can see what's blocking it.
+                logging.info(
+                    "Skipping %s on %s — %s (HTTP %s)",
+                    target, name, reason or "forbidden", status,
                 )
                 csv_writer.writerow(
                     [run_stamp, "SKIPPED_INHERITED", file_id, name, link, target,
-                     perm.get("role", ""), f"HTTP {status}"]
+                     perm.get("role", ""), f"HTTP {status} {reason}".strip()]
                 )
             else:
                 logging.error("Failed to remove %s from %s: %s", target, name, err)

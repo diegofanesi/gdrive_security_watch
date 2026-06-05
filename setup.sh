@@ -122,55 +122,165 @@ talk to your Drive on your behalf. This is a one-time setup per Google
 account and is entirely free.
 
 At the end of this phase you will have downloaded a file called
-${BOLD}credentials.json${RESET} (Google names it
-client_secret_<random>.apps.googleusercontent.com.json — same thing).
+${BOLD}credentials.json${RESET} (Google actually names it
+client_secret_<long-random-string>.apps.googleusercontent.com.json — same thing,
+we'll rename it for you in Phase 2).
 
 If you already have credentials.json from a previous setup, you can skip
 the walkthrough — we'll ask for its path next.
+
+${YELLOW}Heads up:${RESET} Google reorganized this UI in 2024. Phase 1.3 below covers
+the ${BOLD}new${RESET} "Google Auth Platform" flow that you will most likely see today.
+If your screen looks different and shows an "OAuth consent screen" page with
+"User Type" radio buttons instead, follow the ${BOLD}LEGACY${RESET} notes inside Step 1.3.
 EOF
 echo
 if confirm "Skip the Google Cloud Console walkthrough?" no; then
   info "Skipping walkthrough."
 else
+  # -------------------------------------------------------------------------
   substep "Step 1.1  Create a Google Cloud project"
-  info "Open: ${CYAN}https://console.cloud.google.com/projectcreate${RESET}"
-  info "  • Project name:           ${BOLD}drive-permission-sweeper${RESET}"
-  info "  • Organization/location:  leave defaults"
-  info "  • Click ${BOLD}Create${RESET}"
-  info "  • Wait until the project is created, then make sure it is selected"
-  info "    in the project picker at the top of the page."
+  # -------------------------------------------------------------------------
+  info "1. In your web browser, open this exact URL:"
+  info "     ${CYAN}https://console.cloud.google.com/projectcreate${RESET}"
+  info "2. If asked to sign in, sign in with the same Google account whose Drive"
+  info "   you want to clean up (so you only need one account for everything)."
+  info "3. If you see a 'Welcome / Country / Terms of Service' screen, pick your"
+  info "   country, tick the ${BOLD}I agree${RESET} checkbox, then click ${BOLD}Agree and continue${RESET}."
+  info "4. On the ${BOLD}New Project${RESET} page, fill in:"
+  info "     • ${BOLD}Project name${RESET}  →  type exactly: ${BOLD}drive-permission-sweeper${RESET}"
+  info "     • ${BOLD}Project ID${RESET}    →  leave whatever Google auto-generates"
+  info "     • ${BOLD}Location${RESET}      →  leave as ${BOLD}No organization${RESET} (the default)"
+  info "5. Click the blue ${BOLD}CREATE${RESET} button (bottom of the form)."
+  info "6. Wait ~10-30 seconds. A notification will appear in the top-right bell"
+  info "   icon saying ${BOLD}Create Project: drive-permission-sweeper${RESET}."
+  info "7. Click that notification (or the project name) to switch into the new"
+  info "   project. Confirm the project picker at the very top of the page now"
+  info "   says: ${BOLD}drive-permission-sweeper${RESET}."
+  info ""
+  info "${YELLOW}If you don't see it selected:${RESET} click the project dropdown at the top"
+  info "of the page (next to the 'Google Cloud' logo) and pick"
+  info "${BOLD}drive-permission-sweeper${RESET} from the list."
   pause
 
+  # -------------------------------------------------------------------------
   substep "Step 1.2  Enable the Google Drive API"
-  info "Open: ${CYAN}https://console.cloud.google.com/apis/library/drive.googleapis.com${RESET}"
-  info "  • Confirm ${BOLD}drive-permission-sweeper${RESET} is selected at the top."
-  info "  • Click ${BOLD}Enable${RESET}."
-  info "  • Wait for the page to reload showing ${BOLD}API enabled${RESET}."
+  # -------------------------------------------------------------------------
+  info "1. Open this exact URL in the same browser:"
+  info "     ${CYAN}https://console.cloud.google.com/apis/library/drive.googleapis.com${RESET}"
+  info "2. ${BOLD}CHECK THE TOP OF THE PAGE${RESET}: the project dropdown must say"
+  info "   ${BOLD}drive-permission-sweeper${RESET}. If it says anything else, click it and"
+  info "   select drive-permission-sweeper from the list."
+  info "3. You should see a card titled ${BOLD}Google Drive API${RESET} with a blue ${BOLD}ENABLE${RESET}"
+  info "   button. Click ${BOLD}ENABLE${RESET}."
+  info "4. Wait ~15 seconds. The page will reload and now show:"
+  info "     • A green check next to ${BOLD}API enabled${RESET}, or"
+  info "     • A new page titled ${BOLD}Google Drive API${RESET} with tabs"
+  info "       (Overview / Metrics / Quotas / Credentials)."
+  info "   Either of those means it worked."
   pause
 
-  substep "Step 1.3  Configure the OAuth consent screen"
-  info "Open: ${CYAN}https://console.cloud.google.com/apis/credentials/consent${RESET}"
-  info "  • User Type:               ${BOLD}External${RESET} → ${BOLD}Create${RESET}"
-  info "  • App name:                ${BOLD}Drive Permission Sweeper${RESET}"
-  info "  • User support email:      ${BOLD}your own email${RESET}"
-  info "  • Developer contact:       ${BOLD}your own email${RESET}"
-  info "  • Click ${BOLD}Save and Continue${RESET}"
-  info "  • Scopes screen:           click ${BOLD}Save and Continue${RESET} (skip)"
-  info "  • Test users:              click ${BOLD}Add Users${RESET}, add the Google account"
-  info "                             whose Drive you want to sweep, then"
-  info "                             ${BOLD}Save and Continue${RESET}"
-  info "  • Summary:                 click ${BOLD}Back to Dashboard${RESET}"
-  info "  • Leave the app in ${BOLD}Testing${RESET} mode (do NOT publish it)."
+  # -------------------------------------------------------------------------
+  substep "Step 1.3  Configure the consent screen (Google Auth Platform)"
+  # -------------------------------------------------------------------------
+  info "1. Open this exact URL:"
+  info "     ${CYAN}https://console.cloud.google.com/auth/overview${RESET}"
+  info "2. Confirm the project picker at the top still says"
+  info "   ${BOLD}drive-permission-sweeper${RESET}."
+  info ""
+  info "${BOLD}You will see one of two possible screens. Find yours below:${RESET}"
+  echo
+  info "${BOLD}${GREEN}── SCREEN A (most common in 2025+): \"Google Auth Platform / Get started\" ──${RESET}"
+  info "If you see a big page titled ${BOLD}Google Auth Platform${RESET} with a blue ${BOLD}GET STARTED${RESET}"
+  info "button in the middle:"
+  info ""
+  info "  a. Click the blue ${BOLD}GET STARTED${RESET} button."
+  info "  b. A multi-step form appears. Fill it like this:"
+  info ""
+  info "     ${BOLD}Step 1 of 4 — App Information${RESET}"
+  info "       • ${BOLD}App name${RESET}              →  ${BOLD}Drive Permission Sweeper${RESET}"
+  info "       • ${BOLD}User support email${RESET}    →  pick your own email from the dropdown"
+  info "       • Click ${BOLD}NEXT${RESET}."
+  info ""
+  info "     ${BOLD}Step 2 of 4 — Audience${RESET}"
+  info "       • Select the radio button ${BOLD}External${RESET}"
+  info "         (NOT 'Internal' — that only works for Google Workspace org accounts)."
+  info "       • Click ${BOLD}NEXT${RESET}."
+  info ""
+  info "     ${BOLD}Step 3 of 4 — Contact Information${RESET}"
+  info "       • ${BOLD}Email addresses${RESET}        →  type your own email address"
+  info "         and press Enter so it shows as a chip/tag."
+  info "       • Click ${BOLD}NEXT${RESET}."
+  info ""
+  info "     ${BOLD}Step 4 of 4 — Finish${RESET}"
+  info "       • Tick the checkbox ${BOLD}I agree to the Google API Services: User Data Policy${RESET}."
+  info "       • Click ${BOLD}CONTINUE${RESET}, then click ${BOLD}CREATE${RESET}."
+  info ""
+  info "  c. You're now on the ${BOLD}Google Auth Platform${RESET} dashboard. Look for the"
+  info "     left-hand menu and click ${BOLD}Audience${RESET}."
+  info "  d. Scroll to the ${BOLD}Test users${RESET} section."
+  info "     ${YELLOW}This step is critical — without this you'll get an 'access blocked' error.${RESET}"
+  info "       • Click ${BOLD}+ ADD USERS${RESET}."
+  info "       • In the popup, type the email address of the Google account whose"
+  info "         Drive you want to sweep (the one you used to log in)."
+  info "       • Press Enter so it shows as a chip."
+  info "       • Click ${BOLD}SAVE${RESET}."
+  info "  e. ${BOLD}LEAVE THE APP IN 'Testing' MODE.${RESET} Do NOT click 'Publish app'."
+  info "     The ${BOLD}Publishing status${RESET} should say ${BOLD}Testing${RESET}."
+  echo
+  info "${BOLD}${GREEN}── SCREEN B (older / legacy UI): \"OAuth consent screen\" with User Type ──${RESET}"
+  info "If you see a page titled ${BOLD}OAuth consent screen${RESET} asking you to pick a"
+  info "${BOLD}User Type${RESET} with two radio buttons (Internal / External):"
+  info ""
+  info "  a. Select ${BOLD}External${RESET}, then click ${BOLD}CREATE${RESET}."
+  info "  b. ${BOLD}Page 1 — App information${RESET}:"
+  info "     • ${BOLD}App name${RESET}            →  ${BOLD}Drive Permission Sweeper${RESET}"
+  info "     • ${BOLD}User support email${RESET}  →  pick your own email"
+  info "     • Scroll to the bottom — ${BOLD}Developer contact information${RESET}:"
+  info "       enter your own email address."
+  info "     • Click ${BOLD}SAVE AND CONTINUE${RESET}."
+  info "  c. ${BOLD}Page 2 — Scopes${RESET}: don't change anything."
+  info "     • Click ${BOLD}SAVE AND CONTINUE${RESET}."
+  info "  d. ${BOLD}Page 3 — Test users${RESET}:"
+  info "     • Click ${BOLD}+ ADD USERS${RESET}."
+  info "     • Type the email of the Google account whose Drive you want to sweep,"
+  info "       press Enter, then click ${BOLD}ADD${RESET}."
+  info "     • Click ${BOLD}SAVE AND CONTINUE${RESET}."
+  info "  e. ${BOLD}Page 4 — Summary${RESET}: scroll down and click ${BOLD}BACK TO DASHBOARD${RESET}."
+  info "  f. ${BOLD}LEAVE THE APP IN 'Testing'.${RESET} Do NOT click 'Publish app'."
   pause
 
-  substep "Step 1.4  Create the OAuth client ID"
-  info "Open: ${CYAN}https://console.cloud.google.com/apis/credentials${RESET}"
-  info "  • Click ${BOLD}Create Credentials${RESET} → ${BOLD}OAuth client ID${RESET}"
-  info "  • Application type:        ${BOLD}Desktop app${RESET}"
-  info "  • Name:                    ${BOLD}drive-sweeper-cli${RESET}"
-  info "  • Click ${BOLD}Create${RESET}"
-  info "  • In the popup, click ${BOLD}Download JSON${RESET}."
-  info "  • Note the path where your browser saved it (Downloads folder is fine)."
+  # -------------------------------------------------------------------------
+  substep "Step 1.4  Create the OAuth client ID and download credentials.json"
+  # -------------------------------------------------------------------------
+  info "1. Open this exact URL:"
+  info "     ${CYAN}https://console.cloud.google.com/auth/clients${RESET}"
+  info ""
+  info "   (If that page 404s for you, use the older URL instead:"
+  info "     ${CYAN}https://console.cloud.google.com/apis/credentials${RESET})"
+  info ""
+  info "2. Confirm the project picker at the top says ${BOLD}drive-permission-sweeper${RESET}."
+  info "3. Click the blue ${BOLD}+ CREATE CLIENT${RESET} button at the top of the page."
+  info "   (On the legacy URL the button is labelled ${BOLD}+ CREATE CREDENTIALS${RESET} →"
+  info "    pick ${BOLD}OAuth client ID${RESET} from the dropdown.)"
+  info "4. Fill the form:"
+  info "     • ${BOLD}Application type${RESET}  →  open the dropdown, pick ${BOLD}Desktop app${RESET}"
+  info "       ${YELLOW}(NOT 'Web application' — Desktop is required for this script.)${RESET}"
+  info "     • ${BOLD}Name${RESET}              →  type ${BOLD}drive-sweeper-cli${RESET}"
+  info "5. Click the blue ${BOLD}CREATE${RESET} button at the bottom."
+  info "6. A popup titled ${BOLD}OAuth client created${RESET} appears showing a Client ID"
+  info "   and Client secret."
+  info ""
+  info "   ${BOLD}LOOK FOR THE 'DOWNLOAD JSON' BUTTON.${RESET}"
+  info "     • In the new UI: click ${BOLD}DOWNLOAD JSON${RESET} in the popup."
+  info "     • If you accidentally closed the popup: on the Clients list page,"
+  info "       find your ${BOLD}drive-sweeper-cli${RESET} row, click the download icon"
+  info "       (downward arrow ⬇) on the right side of the row."
+  info ""
+  info "7. Your browser saves a file named something like:"
+  info "     ${BOLD}client_secret_123456789-abc...apps.googleusercontent.com.json${RESET}"
+  info "   It usually lands in your ${BOLD}~/Downloads${RESET} folder."
+  info "   ${BOLD}Remember (or copy) the full path${RESET} — Phase 2 will ask for it."
   pause
 fi
 
