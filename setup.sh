@@ -1,0 +1,446 @@
+#!/usr/bin/env bash
+# Interactive setup wizard for the Google Drive Permission Sweeper.
+#
+# Walks you through:
+#   0. Prerequisite check (docker)
+#   1. Google Cloud Console — project, API, consent screen, OAuth client
+#   2. Importing the downloaded credentials.json
+#   3. Building the whitelist of allowed emails
+#   4. Building the Docker image
+#   5. One-time OAuth authorization (browser dance with port forwarding)
+#   6. Dry run + audit-CSV review
+#   7. Real execution (with explicit typed confirmation)
+
+set -euo pipefail
+
+# ---------------------------------------------------------------------------
+# Pretty output
+# ---------------------------------------------------------------------------
+if [ -t 1 ]; then
+  RED=$'\033[0;31m'; GREEN=$'\033[0;32m'; YELLOW=$'\033[0;33m'
+  BLUE=$'\033[0;34m'; CYAN=$'\033[0;36m'; BOLD=$'\033[1m'; RESET=$'\033[0m'
+else
+  RED=; GREEN=; YELLOW=; BLUE=; CYAN=; BOLD=; RESET=
+fi
+
+heading() {
+  echo
+  echo "${BOLD}${BLUE}═══════════════════════════════════════════════════════════════════════${RESET}"
+  echo "${BOLD}${BLUE}  $1${RESET}"
+  echo "${BOLD}${BLUE}═══════════════════════════════════════════════════════════════════════${RESET}"
+  echo
+}
+substep() { echo; echo "${BOLD}${CYAN}▶ $1${RESET}"; }
+info()    { echo "  $1"; }
+ok()      { echo "${GREEN}✓${RESET} $1"; }
+warn()    { echo "${YELLOW}⚠${RESET} $1"; }
+err()     { echo "${RED}✗${RESET} $1" >&2; }
+fatal()   { err "$1"; exit 1; }
+pause()   { read -r -p "${BOLD}Press [Enter] when done...${RESET} " _; }
+
+confirm() {
+  # confirm "Prompt" [yes|no]   — returns 0 if user confirms
+  local prompt=$1 default=${2:-no} response
+  if [ "$default" = "yes" ]; then
+    read -r -p "$prompt ${BOLD}[Y/n]${RESET} " response
+    response=${response:-y}
+  else
+    read -r -p "$prompt ${BOLD}[y/N]${RESET} " response
+    response=${response:-n}
+  fi
+  [[ "$response" =~ ^[Yy] ]]
+}
+
+# ---------------------------------------------------------------------------
+# Paths & constants
+# ---------------------------------------------------------------------------
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$HERE"
+
+IMAGE_NAME="gdrive-sweeper"
+CREDS_PATH="$HERE/credentials.json"
+TOKEN_PATH="$HERE/token.json"
+WHITELIST_PATH="$HERE/whitelist.txt"
+OAUTH_PORT="${OAUTH_PORT:-8080}"
+
+# On Linux, run the container as the host user so output files aren't owned
+# by root. Docker Desktop (macOS/Windows) maps ownership automatically.
+USER_FLAG=()
+if [ "$(uname -s)" = "Linux" ]; then
+  USER_FLAG=(--user "$(id -u):$(id -g)")
+fi
+
+# ---------------------------------------------------------------------------
+# Banner
+# ---------------------------------------------------------------------------
+clear || true
+cat <<BANNER
+${BOLD}${BLUE}╔═══════════════════════════════════════════════════════════════════════╗
+║         Google Drive Permission Sweeper — Setup Wizard                ║
+║                                                                       ║
+║  This wizard will:                                                    ║
+║    1. Walk you through Google Cloud Console (manual, step-by-step)    ║
+║    2. Help you build a whitelist of allowed email addresses           ║
+║    3. Build a Docker image with the sweeper inside                    ║
+║    4. Run the OAuth flow once to authorize the script                 ║
+║    5. Run a dry-run so you can review what would change               ║
+║    6. (Optionally) execute the real sweep                             ║
+╚═══════════════════════════════════════════════════════════════════════╝${RESET}
+BANNER
+echo
+confirm "Ready to start?" yes || { info "Aborted."; exit 0; }
+
+# ---------------------------------------------------------------------------
+# Phase 0  —  Prerequisites
+# ---------------------------------------------------------------------------
+heading "Phase 0  Checking prerequisites"
+
+if ! command -v docker >/dev/null 2>&1; then
+  fatal "Docker is not installed or not on PATH. Install it first: https://docs.docker.com/get-docker/"
+fi
+ok "Docker found: $(docker --version)"
+
+if ! docker info >/dev/null 2>&1; then
+  fatal "Docker daemon is not running. Start Docker and re-run this script."
+fi
+ok "Docker daemon is running."
+
+if command -v lsof >/dev/null 2>&1 && lsof -iTCP:"$OAUTH_PORT" -sTCP:LISTEN >/dev/null 2>&1; then
+  warn "Host port $OAUTH_PORT is already in use."
+  warn "Either free it, or rerun with: OAUTH_PORT=8181 ./setup.sh"
+  confirm "Continue anyway?" no || exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# Phase 1  —  Google Cloud Console (manual, guided)
+# ---------------------------------------------------------------------------
+heading "Phase 1  Create OAuth credentials in Google Cloud Console"
+
+cat <<EOF
+You need to register a small app in Google Cloud Console so the script can
+talk to your Drive on your behalf. This is a one-time setup per Google
+account and is entirely free.
+
+At the end of this phase you will have downloaded a file called
+${BOLD}credentials.json${RESET} (Google names it
+client_secret_<random>.apps.googleusercontent.com.json — same thing).
+
+If you already have credentials.json from a previous setup, you can skip
+the walkthrough — we'll ask for its path next.
+EOF
+echo
+if confirm "Skip the Google Cloud Console walkthrough?" no; then
+  info "Skipping walkthrough."
+else
+  substep "Step 1.1  Create a Google Cloud project"
+  info "Open: ${CYAN}https://console.cloud.google.com/projectcreate${RESET}"
+  info "  • Project name:           ${BOLD}drive-permission-sweeper${RESET}"
+  info "  • Organization/location:  leave defaults"
+  info "  • Click ${BOLD}Create${RESET}"
+  info "  • Wait until the project is created, then make sure it is selected"
+  info "    in the project picker at the top of the page."
+  pause
+
+  substep "Step 1.2  Enable the Google Drive API"
+  info "Open: ${CYAN}https://console.cloud.google.com/apis/library/drive.googleapis.com${RESET}"
+  info "  • Confirm ${BOLD}drive-permission-sweeper${RESET} is selected at the top."
+  info "  • Click ${BOLD}Enable${RESET}."
+  info "  • Wait for the page to reload showing ${BOLD}API enabled${RESET}."
+  pause
+
+  substep "Step 1.3  Configure the OAuth consent screen"
+  info "Open: ${CYAN}https://console.cloud.google.com/apis/credentials/consent${RESET}"
+  info "  • User Type:               ${BOLD}External${RESET} → ${BOLD}Create${RESET}"
+  info "  • App name:                ${BOLD}Drive Permission Sweeper${RESET}"
+  info "  • User support email:      ${BOLD}your own email${RESET}"
+  info "  • Developer contact:       ${BOLD}your own email${RESET}"
+  info "  • Click ${BOLD}Save and Continue${RESET}"
+  info "  • Scopes screen:           click ${BOLD}Save and Continue${RESET} (skip)"
+  info "  • Test users:              click ${BOLD}Add Users${RESET}, add the Google account"
+  info "                             whose Drive you want to sweep, then"
+  info "                             ${BOLD}Save and Continue${RESET}"
+  info "  • Summary:                 click ${BOLD}Back to Dashboard${RESET}"
+  info "  • Leave the app in ${BOLD}Testing${RESET} mode (do NOT publish it)."
+  pause
+
+  substep "Step 1.4  Create the OAuth client ID"
+  info "Open: ${CYAN}https://console.cloud.google.com/apis/credentials${RESET}"
+  info "  • Click ${BOLD}Create Credentials${RESET} → ${BOLD}OAuth client ID${RESET}"
+  info "  • Application type:        ${BOLD}Desktop app${RESET}"
+  info "  • Name:                    ${BOLD}drive-sweeper-cli${RESET}"
+  info "  • Click ${BOLD}Create${RESET}"
+  info "  • In the popup, click ${BOLD}Download JSON${RESET}."
+  info "  • Note the path where your browser saved it (Downloads folder is fine)."
+  pause
+fi
+
+# ---------------------------------------------------------------------------
+# Phase 2  —  Import credentials.json
+# ---------------------------------------------------------------------------
+heading "Phase 2  Provide credentials.json"
+
+while true; do
+  if [ -f "$CREDS_PATH" ]; then
+    info "Found existing credentials at: ${BOLD}$CREDS_PATH${RESET}"
+    if confirm "Use this file?" yes; then
+      ok "Using existing credentials.json"
+      break
+    fi
+  fi
+
+  read -r -p "Path to the credentials JSON you just downloaded: " CRED_INPUT
+  CRED_INPUT="${CRED_INPUT/#\~/$HOME}"
+  if [ ! -f "$CRED_INPUT" ]; then
+    err "File not found: $CRED_INPUT"
+    continue
+  fi
+  if ! grep -q "client_id" "$CRED_INPUT" 2>/dev/null; then
+    warn "That file does not look like a Google OAuth credentials JSON (no 'client_id')."
+    confirm "Use it anyway?" no || continue
+  fi
+  cp "$CRED_INPUT" "$CREDS_PATH"
+  chmod 600 "$CREDS_PATH"
+  ok "Saved credentials to: $CREDS_PATH"
+  break
+done
+
+# ---------------------------------------------------------------------------
+# Phase 3  —  Whitelist
+# ---------------------------------------------------------------------------
+heading "Phase 3  Build whitelist of allowed emails"
+
+cat <<EOF
+The whitelist is a plain text file: one email per line. Anyone NOT on it
+will have their access ${BOLD}REVOKED${RESET}, including 'anyone with the link' shares
+and domain-wide shares. You (the owner) are always skipped — you cannot
+lose access to your own files.
+EOF
+
+build_whitelist=1
+if [ -f "$WHITELIST_PATH" ]; then
+  echo
+  echo "Existing whitelist at: ${BOLD}$WHITELIST_PATH${RESET}"
+  echo "${BOLD}Current contents:${RESET}"
+  echo "────────────────────────────────────────"
+  cat "$WHITELIST_PATH"
+  echo "────────────────────────────────────────"
+  if confirm "Keep this whitelist as-is?" yes; then
+    build_whitelist=0
+  fi
+fi
+
+if [ "$build_whitelist" -eq 1 ]; then
+  echo
+  echo "How do you want to provide the whitelist?"
+  echo "  ${BOLD}1${RESET}) Enter emails interactively now"
+  echo "  ${BOLD}2${RESET}) Open it in an editor (\$EDITOR or nano)"
+  echo "  ${BOLD}3${RESET}) Point to an existing whitelist file on disk"
+  read -r -p "Choose [1/2/3]: " choice
+
+  case "$choice" in
+    1)
+      cat > "$WHITELIST_PATH" <<TEMPLATE
+# Whitelist for Drive Permission Sweeper.
+# One email per line. Blank lines and lines starting with '#' are ignored.
+# Anyone NOT on this list will lose access when the sweep runs.
+TEMPLATE
+      echo
+      echo "Enter email addresses one at a time. Blank line (or ${BOLD}done${RESET}) to finish."
+      while true; do
+        read -r -p "  email > " email || break
+        email="${email// /}"
+        if [ -z "$email" ] || [ "$email" = "done" ]; then
+          break
+        fi
+        if [[ "$email" =~ ^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$ ]]; then
+          echo "$email" >> "$WHITELIST_PATH"
+          ok "Added: $email"
+        else
+          warn "Doesn't look like an email — skipped: $email"
+        fi
+      done
+      ;;
+    2)
+      if [ ! -f "$WHITELIST_PATH" ]; then
+        cat > "$WHITELIST_PATH" <<TEMPLATE
+# Whitelist for Drive Permission Sweeper.
+# One email per line. Blank lines and lines starting with '#' are ignored.
+# Anyone NOT on this list will lose access when the sweep runs.
+
+# example@gmail.com
+TEMPLATE
+      fi
+      "${EDITOR:-nano}" "$WHITELIST_PATH"
+      ;;
+    3)
+      read -r -p "Path to your whitelist file: " WL_INPUT
+      WL_INPUT="${WL_INPUT/#\~/$HOME}"
+      [ -f "$WL_INPUT" ] || fatal "File not found: $WL_INPUT"
+      cp "$WL_INPUT" "$WHITELIST_PATH"
+      ;;
+    *)
+      fatal "Invalid choice."
+      ;;
+  esac
+
+  if ! grep -vE '^\s*(#|$)' "$WHITELIST_PATH" >/dev/null 2>&1; then
+    fatal "Whitelist has no entries. Aborting — an empty whitelist would revoke all sharing."
+  fi
+  ok "Whitelist saved to: $WHITELIST_PATH"
+  echo "Whitelisted emails:"
+  grep -vE '^\s*(#|$)' "$WHITELIST_PATH" | sed 's/^/    • /'
+fi
+
+# ---------------------------------------------------------------------------
+# Phase 4  —  Build Docker image
+# ---------------------------------------------------------------------------
+heading "Phase 4  Build the Docker image"
+
+rebuild=1
+if docker image inspect "$IMAGE_NAME" >/dev/null 2>&1; then
+  if ! confirm "Docker image '$IMAGE_NAME' already exists. Rebuild?" no; then
+    rebuild=0
+    ok "Reusing existing image '$IMAGE_NAME'."
+  fi
+fi
+if [ "$rebuild" -eq 1 ]; then
+  docker build -t "$IMAGE_NAME" "$HERE"
+  ok "Built image '$IMAGE_NAME'."
+fi
+
+# ---------------------------------------------------------------------------
+# Phase 5  —  OAuth authorization
+# ---------------------------------------------------------------------------
+heading "Phase 5  Authorize the application (one-time browser sign-in)"
+
+run_oauth=1
+if [ -s "$TOKEN_PATH" ]; then
+  if confirm "Existing token.json found. Reuse it?" yes; then
+    run_oauth=0
+    ok "Reusing existing token."
+  fi
+fi
+
+if [ "$run_oauth" -eq 1 ]; then
+  cat <<EOF
+The container will start a small web server on port ${BOLD}$OAUTH_PORT${RESET} and print a
+URL. You must:
+
+  1. Copy the URL it prints.
+  2. Open it in a browser on this machine.
+  3. Sign in with the Google account you added as a test user.
+  4. Expect an "unverified app" warning. Click:
+        ${BOLD}Advanced  →  Go to Drive Permission Sweeper (unsafe)  →  Continue${RESET}
+  5. Grant the Drive permission.
+  6. The browser will say "Authentication complete." Return here.
+
+EOF
+  pause
+
+  # Touch token.json so the bind mount maps a file (not a directory).
+  : > "$TOKEN_PATH"
+  chmod 600 "$TOKEN_PATH"
+
+  docker run --rm -it \
+    "${USER_FLAG[@]}" \
+    -p "$OAUTH_PORT:$OAUTH_PORT" \
+    -e "OAUTH_PORT=$OAUTH_PORT" \
+    -v "$CREDS_PATH:/app/credentials.json:ro" \
+    -v "$TOKEN_PATH:/app/token.json" \
+    "$IMAGE_NAME" \
+    python docker_oauth.py /app/credentials.json /app/token.json
+
+  if [ ! -s "$TOKEN_PATH" ]; then
+    fatal "Token was not produced. OAuth flow failed — re-run $0."
+  fi
+  ok "Authorization complete. Token cached at: $TOKEN_PATH"
+fi
+
+# ---------------------------------------------------------------------------
+# Phase 6  —  Dry run
+# ---------------------------------------------------------------------------
+heading "Phase 6  Dry run (no changes will be made)"
+
+info "Sweeping your Drive in ${BOLD}DRY-RUN${RESET} mode. This may take a while on a large drive."
+echo
+
+docker run --rm \
+  "${USER_FLAG[@]}" \
+  -v "$CREDS_PATH:/app/credentials.json:ro" \
+  -v "$TOKEN_PATH:/app/token.json" \
+  -v "$WHITELIST_PATH:/app/whitelist.txt:ro" \
+  -v "$HERE:/app/output" \
+  "$IMAGE_NAME" \
+  python drive_permission_sweeper.py \
+    --credentials /app/credentials.json \
+    --token /app/token.json \
+    --whitelist /app/whitelist.txt \
+    --output-dir /app/output \
+    --dry-run
+
+DRY_CSV="$(ls -t "$HERE"/sweep_*.csv 2>/dev/null | head -n1 || true)"
+if [ -n "${DRY_CSV:-}" ] && [ -f "$DRY_CSV" ]; then
+  COUNT="$(grep -c ',DRY_RUN,' "$DRY_CSV" || true)"
+  echo
+  ok "Dry-run audit written to: ${BOLD}$DRY_CSV${RESET}"
+  echo "  ${BOLD}$COUNT${RESET} permission(s) would be revoked."
+  echo "  Open the CSV in a spreadsheet to review every row before executing."
+fi
+
+# ---------------------------------------------------------------------------
+# Phase 7  —  Real execution
+# ---------------------------------------------------------------------------
+heading "Phase 7  Execute the sweep (irreversible)"
+
+cat <<EOF
+${YELLOW}${BOLD}⚠  This step REALLY deletes permissions on Google Drive.${RESET}
+   • Have you already reviewed the dry-run CSV above?
+   • The CSV from this run is your audit trail in case you need to
+     re-share with anyone later.
+   • There is no undo — restoring access means re-sharing manually.
+
+EOF
+
+if ! confirm "Execute the sweep now?" no; then
+  info "Skipping execution. You can re-run this wizard at any time, or run"
+  info "the sweep directly with the command shown below."
+  cat <<EOF
+
+  ${BOLD}Manual execute command (run later):${RESET}
+  docker run --rm \\
+      -v "$CREDS_PATH:/app/credentials.json:ro" \\
+      -v "$TOKEN_PATH:/app/token.json" \\
+      -v "$WHITELIST_PATH:/app/whitelist.txt:ro" \\
+      -v "$HERE:/app/output" \\
+      $IMAGE_NAME \\
+      python drive_permission_sweeper.py \\
+          --credentials /app/credentials.json \\
+          --token /app/token.json \\
+          --whitelist /app/whitelist.txt \\
+          --output-dir /app/output
+
+EOF
+  exit 0
+fi
+
+read -r -p "${RED}${BOLD}Type EXECUTE to confirm:${RESET} " final
+if [ "$final" != "EXECUTE" ]; then
+  fatal "Confirmation not given — aborted."
+fi
+
+docker run --rm \
+  "${USER_FLAG[@]}" \
+  -v "$CREDS_PATH:/app/credentials.json:ro" \
+  -v "$TOKEN_PATH:/app/token.json" \
+  -v "$WHITELIST_PATH:/app/whitelist.txt:ro" \
+  -v "$HERE:/app/output" \
+  "$IMAGE_NAME" \
+  python drive_permission_sweeper.py \
+    --credentials /app/credentials.json \
+    --token /app/token.json \
+    --whitelist /app/whitelist.txt \
+    --output-dir /app/output
+
+heading "Done"
+ok "Sweep complete. Logs and CSV audit are in: ${BOLD}$HERE${RESET}"
+info "Re-run any time with: ${BOLD}./setup.sh${RESET} (subsequent runs will skip the manual steps you've already done)."
