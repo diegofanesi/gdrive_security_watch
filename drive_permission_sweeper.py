@@ -38,9 +38,13 @@ SCOPES = ["https://www.googleapis.com/auth/drive"]
 PAGE_SIZE = 1000
 FIELDS = (
     "nextPageToken, "
-    "files(id, name, mimeType, webViewLink, owners, permissions)"
+    "files(id, name, mimeType, webViewLink, owners, permissions, parents)"
 )
-QUERY = "'me' in owners and trashed = false"
+
+FOLDER_MIME = "application/vnd.google-apps.folder"
+BASE_QUERY = "'me' in owners and trashed = false"
+FOLDER_QUERY = f"{BASE_QUERY} and mimeType = '{FOLDER_MIME}'"
+FILE_QUERY = f"{BASE_QUERY} and mimeType != '{FOLDER_MIME}'"
 
 MAX_RETRIES = 6
 BASE_BACKOFF = 1.0
@@ -211,11 +215,11 @@ def _execute_with_backoff(request):
 # ---------------------------------------------------------------------------
 
 
-def get_all_owned_files(service) -> Iterator[dict]:
+def get_all_owned_files(service, query: str) -> Iterator[dict]:
     page_token = None
     while True:
         request = service.files().list(
-            q=QUERY,
+            q=query,
             fields=FIELDS,
             pageSize=PAGE_SIZE,
             pageToken=page_token,
@@ -227,6 +231,29 @@ def get_all_owned_files(service) -> Iterator[dict]:
         page_token = response.get("nextPageToken")
         if not page_token:
             return
+
+
+def _sort_folders_top_down(folders: list[dict]) -> list[dict]:
+    """Sort owned folders so ancestors come before descendants.
+
+    Folders whose parents aren't in the owned set (root of My Drive, or
+    nested under a folder owned by someone else) are treated as depth 0.
+    For files with multiple parents (a legacy Drive feature) we take the
+    minimum depth across chains. Drive disallows cycles, so we don't guard.
+    """
+    by_id = {f["id"]: f for f in folders}
+    depth_cache: dict[str, int] = {}
+
+    def depth(folder_id: str) -> int:
+        if folder_id in depth_cache:
+            return depth_cache[folder_id]
+        folder = by_id.get(folder_id)
+        parents = [p for p in (folder.get("parents") or []) if p in by_id] if folder else []
+        d = 0 if not parents else 1 + min(depth(p) for p in parents)
+        depth_cache[folder_id] = d
+        return d
+
+    return sorted(folders, key=lambda f: (depth(f["id"]), f.get("name", "")))
 
 
 # ---------------------------------------------------------------------------
@@ -394,20 +421,35 @@ def main(argv: list[str] | None = None) -> int:
              "target", "role", "error"]
         )
 
-        for idx, file in enumerate(get_all_owned_files(service), start=1):
-            kept, revoked, errors = process_file(
-                service, file, whitelist, dry_run, run_stamp, writer
-            )
-            total_files += 1
-            total_kept += kept
-            total_revoked += revoked
-            total_errors += errors
-
-            if idx % 100 == 0:
-                logging.info(
-                    "Progress: %d files processed, %d revocations, %d errors",
-                    idx, total_revoked, total_errors,
+        def run_pass(label: str, items: Iterator[dict]) -> None:
+            nonlocal total_files, total_kept, total_revoked, total_errors
+            logging.info("Pass %s starting", label)
+            pass_files = 0
+            for item in items:
+                kept, revoked, errors = process_file(
+                    service, item, whitelist, dry_run, run_stamp, writer
                 )
+                total_files += 1
+                pass_files += 1
+                total_kept += kept
+                total_revoked += revoked
+                total_errors += errors
+
+                if total_files % 100 == 0:
+                    logging.info(
+                        "Progress: %d items processed, %d revocations, %d errors",
+                        total_files, total_revoked, total_errors,
+                    )
+            logging.info("Pass %s done: %d items", label, pass_files)
+
+        # Pass 1: folders, top-down. Deleting a parent's permission cascades
+        # to all descendants, so by the time we re-list files for pass 2 the
+        # inherited entries will be gone from the snapshot.
+        folders = list(get_all_owned_files(service, FOLDER_QUERY))
+        run_pass("1 (folders, top-down)", iter(_sort_folders_top_down(folders)))
+
+        # Pass 2: non-folder files, with refreshed permission snapshots.
+        run_pass("2 (files)", get_all_owned_files(service, FILE_QUERY))
 
     logging.info("=" * 60)
     logging.info("Sweep complete (DRY_RUN=%s)", dry_run)
