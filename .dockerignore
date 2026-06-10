@@ -1,0 +1,11 @@
+.git/
+.gitignore
+README.md
+setup.sh
+credentials.json
+token.json
+whitelist.txt
+sweep_*.log
+sweep_*.csv
+__pycache__/
+*.pyc
